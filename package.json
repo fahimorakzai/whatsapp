@@ -1,0 +1,29 @@
+{
+  "name": "pearl-whatsapp-service",
+  "version": "3.0.0",
+  "description": "Restart-safe multi-institute WhatsApp linked-device service for Pearl IMS",
+  "main": "src/server.js",
+  "scripts": {
+    "postinstall": "node scripts/install-browser.js",
+    "start": "node src/server.js",
+    "start:api": "node src/server.js api",
+    "start:worker": "node src/server.js worker",
+    "dev": "nodemon src/server.js api"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "multer": "^2.0.2",
+    "qrcode": "^1.5.4",
+    "bullmq": "^5.58.0",
+    "whatsapp-web.js": "^1.34.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
