@@ -15,6 +15,7 @@ const {
   searchMessages
 } = require('./messageRepository');
 const ShardRpcClient = require('./shardRpc');
+const { FileStore, resolveUploadPath } = require('./fileStore');
 const { getShardIdForInstitute, getTotalShards } = require('./shardConfig');
 
 function secureCompare(a, b) {
@@ -41,7 +42,7 @@ function buildConfig() {
   const persistentDataPath = path.resolve(
     process.env.PERSISTENT_DATA_PATH || path.join(os.homedir(), 'pearlnotify-data')
   );
-  const uploadPath = path.resolve(process.env.UPLOAD_PATH || path.join(persistentDataPath, 'uploads'));
+  const uploadPath = resolveUploadPath();
   const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 15);
   return { apiKey, maxUploadMb, persistentDataPath, port, uploadPath };
 }
@@ -61,6 +62,8 @@ function startApiServer() {
 
   const totalShards = getTotalShards();
   const rpc = new ShardRpcClient({ totalShards });
+  const fileStore = new FileStore({ uploadPath: config.uploadPath });
+  fileStore.startPruneTimer();
 
   const app = express();
   const upload = createUploadMiddleware(config.uploadPath, config.maxUploadMb);
@@ -334,6 +337,120 @@ function startApiServer() {
     }
   });
 
+  /*
+   * Durable attachment upload.
+   *
+   * Unlike /api/messages/send-file, the bytes survive the request, so the send
+   * itself can be queued. Upload once, then reference the fileId from as many
+   * send-stored-file calls as there are parents.
+   */
+  app.post('/api/files', upload.single('file'), async (req, res) => {
+    let tmpPath = req.file?.path || null;
+    try {
+      if (!tmpPath) throw new Error('file is required');
+
+      const data = await fileStore.store({
+        tmpPath,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype
+      });
+
+      // The store now owns the bytes; do not let the finally block delete them.
+      tmpPath = null;
+
+      res.status(201).json({ success: true, data });
+    } catch (error) {
+      sendError(res, error);
+    } finally {
+      if (tmpPath && fs.existsSync(tmpPath)) fs.unlink(tmpPath, () => {});
+    }
+  });
+
+  app.get('/api/files/:fileId', async (req, res) => {
+    try {
+      const { path: _absolutePath, ...data } = await fileStore.get(req.params.fileId);
+      res.json({ success: true, data });
+    } catch (error) {
+      sendError(res, error, 404);
+    }
+  });
+
+  app.delete('/api/files/:fileId', async (req, res) => {
+    try {
+      const data = await fileStore.remove(req.params.fileId);
+      res.json({ success: true, data });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  /*
+   * Queued file send. Same 202-plus-messageId contract as /api/messages/send,
+   * and the same retry and whatsapp_message status tracking.
+   */
+  app.post('/api/messages/send-stored-file', async (req, res) => {
+    try {
+      const { instituteId, phone, fileId, caption } = req.body || {};
+
+      if (!instituteId || !phone || !fileId) {
+        return res.status(400).json({
+          success: false,
+          error: 'instituteId, phone and fileId are required'
+        });
+      }
+
+      // Resolve up front so a bad fileId is a 404 on this call rather than a
+      // job that fails minutes later behind the pacing queue.
+      const stored = await fileStore.get(fileId);
+
+      const shardId = getShardIdForInstitute(
+          instituteId,
+          totalShards
+      );
+
+      const whatsappMessageId = await createMessage({
+        instituteId,
+        phone,
+        message: String(caption || ''),
+        messageType: 'file',
+        shardId,
+        fileId: stored.fileId,
+        fileName: stored.filename
+      });
+
+      const job = await rpc.enqueue(
+          instituteId,
+          'send-stored-file',
+          {
+            whatsappMessageId,
+            phone,
+            fileId: stored.fileId,
+            caption: String(caption || '')
+          }
+      );
+
+      await setJobId(
+          whatsappMessageId,
+          job.id
+      );
+
+      return res.status(202).json({
+        success: true,
+        data: {
+          status: 'QUEUED',
+          messageId: whatsappMessageId,
+          jobId: job.id,
+          shardId,
+          fileId: stored.fileId,
+          filename: stored.filename
+        }
+      });
+
+    } catch (error) {
+      sendError(res, error, 500);
+    }
+  });
+
   app.post('/api/sessions/:instituteId/disconnect', async (req, res) => {
     try {
       const data = await rpc.dispatch(req.params.instituteId, 'session-disconnect', {
@@ -358,12 +475,14 @@ function startApiServer() {
       `Pearl WhatsApp API v3.0.0 listening on port ${config.port} (pid ${process.pid})`
     );
     console.log(`[api] uploadPath=${config.uploadPath}`);
+    console.log(`[api] fileStorePath=${fileStore.rootPath}`);
     console.log(`[api] totalShards=${totalShards}`);
   });
 
   async function shutdown(signal) {
     console.log(`[api][pid:${process.pid}] received ${signal}; shutting down`);
     server.close(async () => {
+      fileStore.stopPruneTimer();
       await rpc.close();
       process.exit(0);
     });

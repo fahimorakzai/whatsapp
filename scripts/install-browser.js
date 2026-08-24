@@ -1,3 +1,13 @@
+// Load .env before resolving PERSISTENT_DATA_PATH. Without this the installer
+// silently falls back to the Hostinger default while sessionManager.js -- which
+// does get dotenv, via the service entrypoint -- looks somewhere else, and the
+// worker then fails at runtime with "Could not find Chrome".
+try {
+  require('dotenv').config();
+} catch (_) {
+  // dotenv is a declared dependency; this only trips in an odd install order.
+}
+
 const { spawnSync } = require('child_process');
 const os = require('os');
 const path = require('path');

@@ -8,19 +8,21 @@
     "start": "node src/server.js",
     "start:api": "node src/server.js api",
     "start:worker": "node src/server.js worker",
-    "dev": "nodemon src/server.js api"
+    "dev": "nodemon src/server.js api",
+    "dev:worker": "WHATSAPP_SHARD_ID=0 nodemon src/server.js worker"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "bullmq": "^5.58.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "helmet": "^8.0.0",
     "multer": "^2.0.2",
+    "mysql2": "^3.11.5",
     "qrcode": "^1.5.4",
-    "bullmq": "^5.58.0",
     "whatsapp-web.js": "^1.34.7"
   },
   "devDependencies": {

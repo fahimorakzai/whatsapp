@@ -54,7 +54,8 @@ class ShardRpcClient {
 
   async enqueueToShard(shardId, command, payload = {}, options = {}) {
     const queue = this.getQueue(shardId);
-    const isMessage = command === 'send-text';
+    // Tracked sends: retried with backoff and kept longer in the queue history.
+    const isMessage = command === 'send-text' || command === 'send-stored-file';
     return queue.add(command, payload, {
       removeOnComplete: { age: 3600, count: isMessage ? 5000 : 1000 },
       removeOnFail: { age: 86400, count: isMessage ? 10000 : 5000 },

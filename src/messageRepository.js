@@ -5,7 +5,9 @@ async function createMessage({
                                  phone,
                                  message,
                                  messageType = 'text',
-                                 shardId
+                                 shardId,
+                                 fileId = null,
+                                 fileName = null
                              }) {
     const [result] = await pool.execute(
         `
@@ -16,17 +18,21 @@ async function createMessage({
         message_type,
         message,
         shard_id,
+        file_id,
+        file_name,
         status,
         queued_at
       )
-      VALUES (?, ?, ?, ?, ?, 'Queued', NOW())
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'Queued', NOW())
     `,
         [
             instituteId,
             phone,
             messageType,
             message,
-            shardId
+            shardId,
+            fileId,
+            fileName
         ]
     );
 
@@ -184,6 +190,8 @@ async function searchMessages(filters = {}) {
         phone,
         message_type,
         message,
+        file_id,
+        file_name,
         job_id,
         shard_id,
         status,

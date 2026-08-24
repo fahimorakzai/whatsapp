@@ -14,6 +14,54 @@ shardId = instituteId % WHATSAPP_TOTAL_SHARDS
 
 Default shard count is `16`.
 
+## Running locally
+
+Redis and MySQL come from `docker-compose.dev.yml`; the Node processes run on the host so Puppeteer can use your own Chrome download.
+
+```bash
+docker compose -f docker-compose.dev.yml up -d   # redis :6380, mysql :3308
+cp .env.dev.example .env                         # already points at those ports
+npm install                                      # postinstall downloads Chrome (~1 min)
+
+npm run dev            # API on :3100
+npm run dev:worker     # shard 0, in a second terminal
+```
+
+`.env.dev.example` sets `WHATSAPP_TOTAL_SHARDS=1`, so every institute maps to shard 0 and one worker covers them all. Raise it only when you are specifically testing sharding — with the production value of `16` you must run the worker whose id equals `instituteId % 16`, or jobs queue and nothing ever picks them up.
+
+The MySQL container applies `sql/` on first boot. To reset the database:
+
+```bash
+docker compose -f docker-compose.dev.yml down -v
+docker compose -f docker-compose.dev.yml up -d
+```
+
+Smoke test without touching WhatsApp:
+
+```bash
+curl localhost:3100/health
+
+curl -X POST localhost:3100/api/files \
+  -H "x-api-key: local-dev-key" -F "file=@some.pdf"
+
+curl -X POST localhost:3100/api/messages/send-stored-file \
+  -H "x-api-key: local-dev-key" -H "Content-Type: application/json" \
+  -d '{"instituteId":696,"phone":"03001234567","fileId":"<id>","caption":"test"}'
+
+curl "localhost:3100/api/messages?instituteId=696" -H "x-api-key: local-dev-key"
+```
+
+That exercises upload, queueing, the worker's job dispatch and the `whatsapp_message` status transitions. With no linked device the job fails on `WhatsApp session did not become CONNECTED within 45 seconds` after 3 attempts, which is the correct outcome and still proves the whole path.
+
+To send for real you must link a device, and that means a real WhatsApp account — use a spare SIM, not a school's number:
+
+```bash
+curl -X POST localhost:3100/api/sessions/696/start -H "x-api-key: local-dev-key"
+curl localhost:3100/api/sessions/696/qr -H "x-api-key: local-dev-key"   # qrDataUrl -> paste in a browser
+```
+
+Linked-device credentials land in `PERSISTENT_DATA_PATH/sessions/`, which `.env.dev.example` points at `/tmp/pearlnotify-data` so a local experiment never mixes with production data.
+
 ## Process roles
 
 API:
@@ -140,11 +188,98 @@ pm2 status
 
 You should see `17` processes total: `pearlnotify-api` plus `pearlnotify-shard-0` through `pearlnotify-shard-15`.
 
-## File send caveat
+## Sending files
 
-`POST /api/messages/send-file` intentionally remains synchronous.
+There are two file paths. Prefer the second.
 
-It still uses request/reply because uploaded files are currently stored as temporary local files and deleted after the request finishes. Do not switch file sends to queued background processing until attachments are persisted to durable shared storage first.
+### `POST /api/messages/send-file` (legacy, synchronous)
+
+Multipart upload plus send in one request. It intentionally remains synchronous: the uploaded file is a temp file that the API deletes in a `finally` block once the RPC returns, so the send has to finish before the bytes disappear. No retries, no `whatsapp_message` row.
+
+### `POST /api/files` + `POST /api/messages/send-stored-file` (queued)
+
+Upload once to durable storage, then queue as many sends as there are recipients. This is what the "results to parents" flow uses.
+
+Step 1 — upload the attachment:
+
+```bash
+curl -X POST http://localhost:3100/api/files \
+  -H "x-api-key: $API_KEY" \
+  -F "file=@term-result-1043.pdf"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "fileId": "dcfd74f6-e48c-4780-97a4-018b3b562a67",
+    "filename": "term-result-1043.pdf",
+    "mimeType": "application/pdf",
+    "sizeBytes": 51221,
+    "createdAt": "2026-08-23T08:52:56.394Z",
+    "expiresAt": "2026-08-25T08:52:56.394Z"
+  }
+}
+```
+
+Step 2 — queue the send:
+
+```bash
+curl -X POST http://localhost:3100/api/messages/send-stored-file \
+  -H "x-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "instituteId": 696,
+        "phone": "03001234567",
+        "fileId": "dcfd74f6-e48c-4780-97a4-018b3b562a67",
+        "caption": "Term result for Ali Khan"
+      }'
+```
+
+Returns `202` with the same shape as `/api/messages/send`, plus the file:
+
+```json
+{
+  "success": true,
+  "data": {
+    "status": "QUEUED",
+    "messageId": 1,
+    "jobId": "1",
+    "shardId": 0,
+    "fileId": "dcfd74f6-e48c-4780-97a4-018b3b562a67",
+    "filename": "term-result-1043.pdf"
+  }
+}
+```
+
+Track it exactly like a text send: `GET /api/messages/:messageId`, or `GET /api/messages?instituteId=696&status=Failed`.
+
+Supporting routes:
+
+- `GET /api/files/:fileId` — metadata; `404` once gone, `410` once expired.
+- `DELETE /api/files/:fileId` — remove immediately rather than waiting for TTL.
+
+### Storage and lifetime
+
+Attachments live under `UPLOAD_PATH/store/<fileId>/`, which is below `PERSISTENT_DATA_PATH` and therefore survives redeploys. The API and every shard worker read the same directory, which is why they must run on one host — a worker on a second machine cannot see the file.
+
+Nothing deletes on send, because one file may go to many parents. `FILE_STORE_TTL_HOURS` (default `48`) governs expiry; the API sweeps hourly. Workers never prune, so sixteen sweepers cannot race each other.
+
+Uploads are capped by `MAX_UPLOAD_MB` (default `15`). That is a deliberate ceiling, not WhatsApp's: `MessageMedia.fromFilePath` base64s the whole file inside a process that is already running Chrome.
+
+### Failure behaviour
+
+Queued file sends get `send-text`'s treatment — 3 attempts, exponential backoff from 5s, `whatsapp_message` status transitions.
+
+The exception is a missing, expired or malformed `fileId`. Those fail identically on every attempt, so they raise BullMQ's `UnrecoverableError`: the row goes straight to `Failed` on attempt 1 rather than sitting on `Retrying` for a job that will never run again.
+
+A bad `fileId` known at request time is rejected as `404`/`410` by `send-stored-file` itself, before anything is queued.
+
+### Sending one result per parent
+
+Each parent gets a different PDF, so the loop is: generate PDF → `POST /api/files` → `POST /api/messages/send-stored-file`. Upload-once-send-many only helps for a shared document such as a notice.
+
+Remember the pacing ceiling. `WHATSAPP_PER_INSTITUTE_MAX_PER_MINUTE=5` means 300/hour for one institute, so 400 result cards take roughly 80 minutes. That dial is ban-risk management, not throughput — raise it knowingly. Pacing is per-institute, so unrelated schools run in parallel.
 
 Restart-safe Node.js/Express service for Pearl IMS linked-device WhatsApp sessions.
 
@@ -181,6 +316,12 @@ Do not set `SESSION_PATH=./sessions` on Hostinger because `./sessions` would be 
 - `GET /api/sessions`
 - `POST /api/messages/send`
 - `POST /api/messages/send-file`
+- `POST /api/files`
+- `GET /api/files/:fileId`
+- `DELETE /api/files/:fileId`
+- `POST /api/messages/send-stored-file`
+- `GET /api/messages`
+- `GET /api/messages/:messageId`
 - `POST /api/sessions/:instituteId/disconnect`
 
 Protected routes require:

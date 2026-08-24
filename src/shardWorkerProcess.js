@@ -3,7 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const { Worker } = require('bullmq');
+const { UnrecoverableError, Worker } = require('bullmq');
 
 const {
   markProcessing,
@@ -13,6 +13,7 @@ const {
 } = require('./messageRepository');
 
 const SessionManager = require('./sessionManager');
+const { FileStore } = require('./fileStore');
 const connection = require('./queueConnection');
 
 const {
@@ -118,20 +119,22 @@ class InstituteSendScheduler {
 }
 
 
-async function processTextMessage(
+/*
+ * Shared bookkeeping for every tracked send.
+ *
+ * Text and file sends differ only in how the bytes reach WhatsApp, so the
+ * pacing, whatsapp_message status transitions and retry accounting live here
+ * once. `performSend` runs inside the institute's pacing window and returns
+ * whatever SessionManager returns.
+ */
+async function processTrackedSend(
     job,
-    sessions,
-    sendScheduler
+    sendScheduler,
+    performSend
 ) {
 
   const instituteId =
       job.data?.instituteId;
-
-  const phone =
-      job.data?.phone;
-
-  const message =
-      job.data?.message;
 
   const whatsappMessageId =
       job.data?.whatsappMessageId;
@@ -153,6 +156,7 @@ async function processTextMessage(
       `[id:${whatsappMessageId || 'none'}]` +
       `[job:${job.id}]` +
       `[institute:${instituteId}]` +
+      `[${job.name}]` +
       ` attempt=${currentAttempt}/${maxAttempts}`
   );
 
@@ -180,11 +184,7 @@ async function processTextMessage(
         try {
 
           const result =
-              await sessions.sendText(
-                  instituteId,
-                  phone,
-                  message
-              );
+              await performSend();
 
 
           /*
@@ -217,10 +217,23 @@ async function processTextMessage(
 
 
           /*
+           * Some failures fail identically on every
+           * attempt - a missing or expired attachment,
+           * a malformed fileId. Retrying those only
+           * burns the backoff schedule, and leaving the
+           * row on 'Retrying' would strand it there
+           * because BullMQ never runs the job again.
+           */
+          const isUnrecoverable =
+              Boolean(error?.unrecoverable);
+
+
+          /*
            * BullMQ will retry if there are
            * attempts remaining.
            */
           const hasMoreAttempts =
+              !isUnrecoverable &&
               currentAttempt < maxAttempts;
 
 
@@ -276,6 +289,13 @@ async function processTextMessage(
            * Without this, BullMQ would mark the
            * job as completed and would not retry it.
            */
+          if (isUnrecoverable) {
+
+            throw new UnrecoverableError(
+                errorMessage
+            );
+          }
+
           throw error;
         }
       }
@@ -285,7 +305,8 @@ async function processTextMessage(
 
 function createCommandProcessor(
     sessions,
-    sendScheduler
+    sendScheduler,
+    fileStore
 ) {
 
   return async (job) => {
@@ -399,19 +420,58 @@ function createCommandProcessor(
          */
       case 'send-text':
 
-        return processTextMessage(
+        return processTrackedSend(
             job,
-            sessions,
-            sendScheduler
+            sendScheduler,
+            () =>
+                sessions.sendText(
+                    instituteId,
+                    job.data?.phone,
+                    job.data?.message
+                )
         );
 
 
         /*
-         * FILE MESSAGE
+         * STORED FILE MESSAGE
          *
-         * Keep synchronous for now because
-         * apiServer deletes the temporary file
-         * after RPC completes.
+         * The attachment already lives in the durable
+         * file store, so this gets the same retries and
+         * whatsapp_message tracking as send-text.
+         *
+         * Resolving inside the callback keeps the
+         * base64 read after the pacing wait, so a job
+         * sleeping out its rate-limit window is not
+         * also holding the whole file in memory.
+         */
+      case 'send-stored-file':
+
+        return processTrackedSend(
+            job,
+            sendScheduler,
+            async () => {
+
+              const stored =
+                  await fileStore.get(
+                      job.data?.fileId
+                  );
+
+              return sessions.sendFile(
+                  instituteId,
+                  job.data?.phone,
+                  stored.path,
+                  job.data?.caption
+              );
+            }
+        );
+
+
+        /*
+         * FILE MESSAGE (legacy, multipart)
+         *
+         * Stays synchronous because apiServer deletes
+         * the temporary file after RPC completes.
+         * Prefer send-stored-file.
          */
       case 'send-file':
 
@@ -516,6 +576,14 @@ function startShardWorker() {
       new InstituteSendScheduler();
 
 
+  /*
+   * Same UPLOAD_PATH the API writes to. Workers never prune - the API owns
+   * expiry so a single sweeper cannot race sixteen others.
+   */
+  const fileStore =
+      new FileStore();
+
+
   const queueName =
       getShardQueueName(
           shardId
@@ -535,7 +603,8 @@ function startShardWorker() {
 
           createCommandProcessor(
               sessions,
-              sendScheduler
+              sendScheduler,
+              fileStore
           ),
 
           {
@@ -619,6 +688,12 @@ function startShardWorker() {
         console.log(
             `[shard:${shardId}] ` +
             `statePath=${shardStatePath}`
+        );
+
+
+        console.log(
+            `[shard:${shardId}] ` +
+            `fileStorePath=${fileStore.rootPath}`
         );
 
 

@@ -1,0 +1,42 @@
+# Local-only dependencies for pearl-whatsapp-service.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Ports are deliberately off the defaults so this never collides with the
+# pearlims stack (MySQL 3306) or a system Redis (6379).
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: pearlnotify-redis
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mysql:
+    image: mariadb:12.1
+    container_name: pearlnotify-mysql
+    ports:
+      - "3308:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: pearlnotify
+      MARIADB_DATABASE: pearlnotify
+      MARIADB_USER: pearlnotify
+      MARIADB_PASSWORD: pearlnotify
+    volumes:
+      - pearlnotify_mysql_data:/var/lib/mysql
+      # *.sql here runs once, in filename order, on first boot only.
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pearlnotify_mysql_data:

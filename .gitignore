@@ -6,3 +6,5 @@ uploads/*
 npm-debug.log*
 .DS_Store
 .idea/
+.wwebjs_cache/
+.wwebjs_auth/

@@ -809,7 +809,13 @@ class SessionManager {
     let chatId = await this.resolveChatId(session.client, phone);
 
     try {
-      const sent = await session.client.sendMessage(chatId, media, { caption: String(caption || '') });
+      const sent = await session.client.sendMessage(chatId, media, {
+        caption: String(caption || ''),
+        // Always a document. Without this WhatsApp is free to treat the
+        // attachment as previewable media and re-encode it, which is how a
+        // valid PDF arrives openable-but-blank.
+        sendMediaAsDocument: true
+      });
       return {
         messageId: sent?.id?._serialized || null,
         to: chatId,
@@ -828,7 +834,10 @@ class SessionManager {
 
       chatId = await this.resolveChatId(session.client, phone);
       const retryMedia = MessageMedia.fromFilePath(resolvedPath);
-      const sent = await session.client.sendMessage(chatId, retryMedia, { caption: String(caption || '') });
+      const sent = await session.client.sendMessage(chatId, retryMedia, {
+        caption: String(caption || ''),
+        sendMediaAsDocument: true
+      });
 
       return {
         messageId: sent?.id?._serialized || null,
