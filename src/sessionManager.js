@@ -50,6 +50,45 @@ const RESTORE_STAGGER_MS = Number(process.env.WHATSAPP_RESTORE_STAGGER_MS || 150
 const RESTORE_INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_RESTORE_INIT_TIMEOUT_MS || 120000);
 
 /*
+ * On-demand sessions.
+ *
+ * A browser is 556 MB and 11 processes, so holding one open per linked
+ * institute caps the fleet at about ten on an 8 GB box -- while a school
+ * actually sends in a burst once a month. Instead we keep a small pool: start a
+ * browser when work arrives, close it when the work stops.
+ *
+ * MAX_LIVE_SESSIONS is per worker process. With WHATSAPP_TOTAL_SHARDS=1 that is
+ * also the fleet-wide number; with more shards, multiply. Prefer one shard --
+ * institutes shard by `id % TOTAL_SHARDS`, so splitting a pool across two
+ * workers lets the parity of the ids decide the balance.
+ */
+const MAX_LIVE_SESSIONS = Number(process.env.WHATSAPP_MAX_LIVE_SESSIONS || 6);
+
+// How long a session must be quiet before it may be closed or evicted. Long
+// enough that one school's paced run (80 min at 5/min for 400 students) stays a
+// single session rather than being torn down mid-batch.
+const SESSION_IDLE_MS = Number(process.env.WHATSAPP_SESSION_IDLE_MS || 1800000);
+
+// A session may be evicted to make room sooner than the idle timeout, but never
+// while it is mid-send.
+const MIN_IDLE_BEFORE_EVICT_MS = Number(process.env.WHATSAPP_MIN_IDLE_BEFORE_EVICT_MS || 120000);
+
+const IDLE_SWEEP_INTERVAL_MS = Number(process.env.WHATSAPP_IDLE_SWEEP_INTERVAL_MS || 60000);
+
+/*
+ * The pool is full and every live session is mid-send. Unlike unsendableError
+ * this is NOT a failure -- the job is fine, the system is busy. The worker turns
+ * it into a BullMQ delayed retry, which does not consume an attempt.
+ */
+function capacityError(message, retryAfterMs) {
+  const error = new Error(message);
+  error.capacity = true;
+  error.retryAfterMs = retryAfterMs;
+  error.statusCode = 503;
+  return error;
+}
+
+/*
  * `unrecoverable` is the flag shardWorkerProcess turns into BullMQ's
  * UnrecoverableError, so the job is marked Failed once instead of burning its
  * whole retry schedule on something that cannot succeed.
@@ -73,6 +112,11 @@ class SessionManager {
     this.recreateGuards = new Map();
     this.lastLogged = new Map();
 
+    this.maxLiveSessions = Math.max(1, Number(options.maxLiveSessions || MAX_LIVE_SESSIONS));
+    this.sessionIdleMs = Number(options.sessionIdleMs || SESSION_IDLE_MS);
+    this.minIdleBeforeEvictMs = Number(options.minIdleBeforeEvictMs || MIN_IDLE_BEFORE_EVICT_MS);
+    this.idleTimer = null;
+
     fs.mkdirSync(this.sessionPath, { recursive: true });
     fs.mkdirSync(this.statePath, { recursive: true });
     this.loadRegistry();
@@ -93,6 +137,141 @@ class SessionManager {
     if (this.lastLogged.get(mapKey) === message) return;
     this.lastLogged.set(mapKey, message);
     this.log(instituteId, key, message);
+  }
+
+  /*
+   * Mark a session as in use, so the idle sweeper and the eviction search leave
+   * it alone. Called whenever a job touches the session, not only on success --
+   * a send that is mid-retry is still active work.
+   */
+  touch(instituteId) {
+    const session = this.clients.get(instituteId);
+    if (session) session.lastActivityAt = Date.now();
+  }
+
+  /*
+   * Close the browser but keep everything that makes the session restorable:
+   * the registry row stays enabled and the LocalAuth directory is untouched, so
+   * the next message simply starts it again. Status becomes IDLE, which is
+   * deliberately distinct from QR_REQUIRED -- one means "linked, asleep" and
+   * needs no action, the other means an admin has to re-link.
+   */
+  async closeSession(instituteId, reason = 'idle') {
+    instituteId = this.normalizeInstituteId(instituteId);
+    const session = this.clients.get(instituteId);
+    if (!session) return false;
+
+    this.clients.delete(instituteId);
+
+    try {
+      await session.client?.destroy();
+    } catch (error) {
+      this.log(instituteId, 'destroy during close warning', error?.message || String(error));
+    }
+
+    // Leave a terminal state alone: if the session was sitting on a QR screen,
+    // IDLE would hide the fact that it needs a human.
+    const current = this.registry.get(instituteId)?.lastStatus;
+    if (!UNLINKED_STATUSES.has(current)) {
+      this.updateRegistry(instituteId, { lastStatus: 'IDLE', lastError: null });
+    }
+
+    this.log(instituteId, 'session closed', reason);
+    return true;
+  }
+
+  /*
+   * Make room in the pool for one more browser. Evicts the least-recently-used
+   * session that has been quiet long enough; throws capacityError when every
+   * live session is mid-send, which the worker turns into a delayed retry
+   * rather than a failure.
+   */
+  async makeRoomFor(instituteId) {
+    if (this.clients.size < this.maxLiveSessions) return;
+
+    const now = Date.now();
+    let victim = null;
+    let victimIdleSince = Infinity;
+    let soonestBusy = Infinity;
+
+    for (const [id, session] of this.clients) {
+      if (id === instituteId) return;
+
+      const lastActivityAt = session.lastActivityAt || 0;
+      const idleFor = now - lastActivityAt;
+
+      if (idleFor < this.minIdleBeforeEvictMs) {
+        soonestBusy = Math.min(soonestBusy, this.minIdleBeforeEvictMs - idleFor);
+        continue;
+      }
+
+      if (lastActivityAt < victimIdleSince) {
+        victim = id;
+        victimIdleSince = lastActivityAt;
+      }
+    }
+
+    if (!victim) {
+      const retryAfterMs = Number.isFinite(soonestBusy) ? Math.max(30000, soonestBusy) : 60000;
+      throw capacityError(
+          `All ${this.maxLiveSessions} WhatsApp sessions are busy; institute ${instituteId} is queued`,
+          retryAfterMs
+      );
+    }
+
+    await this.closeSession(victim, `evicted to make room for institute ${instituteId}`);
+  }
+
+  /*
+   * Pool admission, called from the worker preflight so a queued job is delayed
+   * before it takes a pacing slot rather than after.
+   */
+  async ensureCapacityFor(instituteId) {
+    instituteId = this.normalizeInstituteId(instituteId);
+    if (this.clients.has(instituteId)) {
+      this.touch(instituteId);
+      return;
+    }
+    await this.makeRoomFor(instituteId);
+  }
+
+  /*
+   * Close sessions nobody has used for sessionIdleMs. Only the browser goes --
+   * credentials and registry stay, so the next message brings it straight back.
+   */
+  async sweepIdleSessions() {
+    const now = Date.now();
+    const stale = [];
+
+    for (const [id, session] of this.clients) {
+      if (now - (session.lastActivityAt || 0) > this.sessionIdleMs) stale.push(id);
+    }
+
+    for (const id of stale) {
+      await this.closeSession(id, `idle for over ${Math.round(this.sessionIdleMs / 60000)} min`);
+    }
+
+    return stale.length;
+  }
+
+  startIdleSweeper(intervalMs = IDLE_SWEEP_INTERVAL_MS) {
+    if (this.idleTimer) return this.idleTimer;
+
+    this.idleTimer = setInterval(() => {
+      this.sweepIdleSessions().catch((error) => {
+        console.error(`[wa][pid:${process.pid}] idle sweep failed: ${error.message}`);
+      });
+    }, intervalMs);
+
+    this.idleTimer.unref();
+    return this.idleTimer;
+  }
+
+  stopIdleSweeper() {
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
   }
 
   recreateGuard(instituteId) {
@@ -300,7 +479,15 @@ class SessionManager {
 
   async start(instituteId, options = {}) {
     instituteId = this.normalizeInstituteId(instituteId);
-    if (this.clients.has(instituteId)) return this.getState(instituteId);
+
+    if (this.clients.has(instituteId)) {
+      this.touch(instituteId);
+      return this.getState(instituteId);
+    }
+
+    // The only place a browser is created, so the only place the pool cap has
+    // to be enforced. Throws capacityError when every live session is busy.
+    await this.makeRoomFor(instituteId);
 
     this.updateRegistry(instituteId, {
       enabled: true,
@@ -310,6 +497,7 @@ class SessionManager {
 
     const session = {
       client: null,
+      lastActivityAt: Date.now(),
       status: options.restoring ? 'RESTORING' : 'STARTING',
       phoneNumber: this.registry.get(instituteId)?.phoneNumber || null,
       qr: null,
@@ -425,36 +613,35 @@ class SessionManager {
     const belongsToShard = typeof options.belongsToShard === 'function'
       ? options.belongsToShard
       : () => true;
+
     this.discoverSessionsFromDisk({ belongsToShard });
+
     const ids = Array.from(this.registry.values())
         .filter((row) => row.enabled)
         .filter((row) => belongsToShard(row.instituteId))
         .map((row) => row.instituteId);
 
-    console.log(`[wa][pid:${process.pid}] restoring ${ids.length} registered session(s)`);
-    for (const [index, instituteId] of ids.entries()) {
-      try {
-        await this.start(instituteId, { restoring: true });
-
-        /*
-         * Wait for this browser to finish booting before starting the next one.
-         * start() returns as soon as the client object exists, so without this
-         * the loop launches every session simultaneously -- 11 Chrome processes
-         * and ~556 MB each, which is what exhausted the box.
-         */
-        const session = this.clients.get(instituteId);
-        if (session?.initPromise) {
-          await Promise.race([session.initPromise, this.sleep(RESTORE_INIT_TIMEOUT_MS)]);
-        }
-
-        if (RESTORE_STAGGER_MS > 0 && index < ids.length - 1) {
-          await this.sleep(RESTORE_STAGGER_MS);
-        }
-      } catch (error) {
-        this.updateRegistry(instituteId, { lastStatus: 'ERROR', lastError: error.message });
-        console.error(`[wa][pid:${process.pid}][institute:${instituteId}] restore failed: ${error.message}`);
+    /*
+     * Registers, does not start. Browsers are created on demand by the first
+     * message for an institute -- see makeRoomFor(). Booting every linked
+     * session at startup is what put 32 browsers on an 8 GB box; it is also
+     * simply wasted, since a school sends in a burst once a month.
+     *
+     * A session already waiting on a human (QR / pairing / auth failure) keeps
+     * that status so the admin screen still shows it needs re-linking.
+     */
+    for (const instituteId of ids) {
+      const current = this.registry.get(instituteId)?.lastStatus;
+      if (!UNLINKED_STATUSES.has(current)) {
+        this.updateRegistry(instituteId, { lastStatus: 'IDLE', lastError: null });
       }
     }
+
+    console.log(
+        `[wa][pid:${process.pid}] registered ${ids.length} session(s); ` +
+        `browsers start on demand (pool max ${this.maxLiveSessions})`
+    );
+
     return ids.length;
   }
 
@@ -865,12 +1052,12 @@ class SessionManager {
   async getStateVerified(instituteId) {
     instituteId = this.normalizeInstituteId(instituteId);
 
-    if (!this.clients.has(instituteId)) {
-      const registry = this.registry.get(instituteId);
-      if (registry?.enabled) {
-        await this.start(instituteId, { restoring: true });
-      }
-    }
+    /*
+     * Deliberately does NOT start a session. The admin screen polls this, and
+     * with on-demand sessions a status check must never cold-start a browser --
+     * opening the settings page would otherwise launch Chrome for the institute.
+     * A registered-but-asleep session reports IDLE from the registry below.
+     */
 
     const session = this.clients.get(instituteId);
     if (!session) return this.baseState(instituteId);

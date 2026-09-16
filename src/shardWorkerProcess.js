@@ -3,7 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const { UnrecoverableError, Worker } = require('bullmq');
+const { DelayedError, UnrecoverableError, Worker } = require('bullmq');
 
 const {
   markProcessing,
@@ -131,7 +131,8 @@ async function processTrackedSend(
     job,
     sendScheduler,
     performSend,
-    preflight
+    preflight,
+    token
 ) {
 
   const instituteId =
@@ -175,9 +176,35 @@ async function processTrackedSend(
 
     try {
 
-      preflight();
+      await preflight();
 
     } catch (error) {
+
+      /*
+       * The pool is full and every live session is mid-send. The job is fine,
+       * the system is busy -- so put it back with a delay instead of failing it.
+       * moveToDelayed + DelayedError does NOT consume a retry attempt, and the
+       * whatsapp_message row is still Queued because markProcessing runs inside
+       * the pacing callback below.
+       */
+      if (error?.capacity) {
+
+        const retryAfterMs =
+            Number(error.retryAfterMs) > 0
+                ? Number(error.retryAfterMs)
+                : 60000;
+
+        console.log(
+            `[message]` +
+            `[id:${whatsappMessageId || 'none'}]` +
+            `[job:${job.id}]` +
+            `[institute:${instituteId}]` +
+            ` delayed ${Math.round(retryAfterMs / 1000)}s: ${error.message}`
+        );
+
+        await job.moveToDelayed(Date.now() + retryAfterMs, token);
+        throw new DelayedError(error.message);
+      }
 
       /*
        * The normal failure handling lives inside the scheduler callback below,
@@ -364,7 +391,7 @@ function createCommandProcessor(
     fileStore
 ) {
 
-  return async (job) => {
+  return async (job, token) => {
 
     const instituteId =
         job.data?.instituteId;
@@ -484,7 +511,11 @@ function createCommandProcessor(
                     job.data?.phone,
                     job.data?.message
                 ),
-            () => sessions.assertSendable(instituteId)
+            async () => {
+              sessions.assertSendable(instituteId);
+              await sessions.ensureCapacityFor(instituteId);
+            },
+            token
         );
 
 
@@ -519,7 +550,11 @@ function createCommandProcessor(
                   job.data?.caption
               );
             },
-            () => sessions.assertSendable(instituteId)
+            async () => {
+              sessions.assertSendable(instituteId);
+              await sessions.ensureCapacityFor(instituteId);
+            },
+            token
         );
 
 
@@ -627,6 +662,13 @@ function startShardWorker() {
         statePath:
         shardStatePath
       });
+
+
+  /*
+   * Close browsers nobody has used lately. Sessions are created on demand by
+   * the pool (SessionManager.makeRoomFor) and reclaimed here.
+   */
+  sessions.startIdleSweeper();
 
 
   const sendScheduler =
