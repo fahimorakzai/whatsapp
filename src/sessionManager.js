@@ -111,7 +111,22 @@ class SessionManager {
    */
   assertSendable(instituteId) {
     const registry = this.registry.get(instituteId);
-    if (registry && registry.enabled === false) {
+
+    /*
+     * A send must never bring a session into existence. Without this an
+     * institute PearlIMS has queued work for -- but which nobody ever linked --
+     * falls through to recreateClient(), cold-starts a browser, sits on a QR
+     * screen, and start() then records it as enabled: true. Creating sessions
+     * is the job of the explicit start / pairing-code endpoints only.
+     */
+    if (!registry) {
+      throw unsendableError(
+          `No WhatsApp session registered for institute ${instituteId} -- ` +
+          'start and link it before sending'
+      );
+    }
+
+    if (registry.enabled === false) {
       throw unsendableError(`WhatsApp session for institute ${instituteId} is disabled`);
     }
 

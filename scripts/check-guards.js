@@ -57,6 +57,9 @@ function register(id, patch) {
 }
 
 console.log('assertSendable -- a send that cannot succeed must not reach Chrome');
+// Regression: an institute nobody ever linked used to fall through to
+// recreateClient(), cold-start a browser and register itself enabled: true.
+check('unregistered institute fails fast', () => throwsUnrecoverable(() => sessions.assertSendable('999')));
 register(10, { lastStatus: 'QR_REQUIRED' });
 check('QR_REQUIRED fails fast', () => throwsUnrecoverable(() => sessions.assertSendable('10')));
 register(11, { enabled: false, lastStatus: 'CONNECTED' });
