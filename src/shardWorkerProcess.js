@@ -130,7 +130,8 @@ class InstituteSendScheduler {
 async function processTrackedSend(
     job,
     sendScheduler,
-    performSend
+    performSend,
+    preflight
 ) {
 
   const instituteId =
@@ -159,6 +160,60 @@ async function processTrackedSend(
       `[${job.name}]` +
       ` attempt=${currentAttempt}/${maxAttempts}`
   );
+
+
+  /*
+   * Refuse impossible sends BEFORE entering the pacing queue.
+   *
+   * The scheduler serialises one institute and sleeps the per-institute
+   * interval inside the active job, so a job that can never succeed would
+   * otherwise hold a concurrency slot for 12s doing nothing. With an institute
+   * PearlIMS keeps queueing for but nobody has linked, that starves the workers
+   * -- it is what made session-pairing-code time out during the 2026-09 bring-up.
+   */
+  if (typeof preflight === 'function') {
+
+    try {
+
+      preflight();
+
+    } catch (error) {
+
+      /*
+       * The normal failure handling lives inside the scheduler callback below,
+       * so a preflight rejection has to record its own outcome -- otherwise the
+       * whatsapp_message row is stranded on 'Queued' and BullMQ retries a job
+       * that can never succeed. preflight throws unsendableError, which is
+       * always unrecoverable; the flag is still honoured rather than assumed.
+       */
+      const errorMessage =
+          error?.message ||
+          String(error);
+
+      if (whatsappMessageId) {
+
+        await markFailed(
+            whatsappMessageId,
+            currentAttempt,
+            errorMessage
+        );
+      }
+
+      console.error(
+          `[message]` +
+          `[id:${whatsappMessageId || 'none'}]` +
+          `[job:${job.id}]` +
+          `[institute:${instituteId}]` +
+          ` rejected before pacing: ${errorMessage}`
+      );
+
+      if (error?.unrecoverable) {
+        throw new UnrecoverableError(errorMessage);
+      }
+
+      throw error;
+    }
+  }
 
 
   /*
@@ -428,7 +483,8 @@ function createCommandProcessor(
                     instituteId,
                     job.data?.phone,
                     job.data?.message
-                )
+                ),
+            () => sessions.assertSendable(instituteId)
         );
 
 
@@ -462,7 +518,8 @@ function createCommandProcessor(
                   stored.path,
                   job.data?.caption
               );
-            }
+            },
+            () => sessions.assertSendable(instituteId)
         );
 
 
@@ -830,5 +887,9 @@ function startShardWorker() {
 
 
 module.exports = {
-  startShardWorker
+  startShardWorker,
+  // Exported for scripts/check-guards.js -- the preflight rejection path has
+  // its own failure bookkeeping and is easy to break silently.
+  processTrackedSend,
+  InstituteSendScheduler
 };
