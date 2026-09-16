@@ -61,8 +61,39 @@ process never touches WhatsApp or Puppeteer; only workers do.
 **Deterministic sharding is the core invariant.** `src/shardConfig.js` owns it:
 `shardId = instituteId % WHATSAPP_TOTAL_SHARDS`. Every institute's WhatsApp session lives in exactly
 one worker process, so `sendMessage` for institute N always reaches the process holding N's browser.
-Anything that changes `WHATSAPP_TOTAL_SHARDS` re-maps institutes to different workers and orphans
-their live sessions — treat it as a migration, not a config tweak.
+
+Changing `WHATSAPP_TOTAL_SHARDS` re-maps institutes to different workers, but it does **not** require
+re-pairing: LocalAuth credentials live in the *shared* `sessions/` directory, and
+`discoverSessionsFromDisk()` rebuilds each shard's registry from there filtered by `belongsToShard`.
+Only the in-memory clients are lost, and those die on any restart anyway. Stop pm2, change the
+number, start pm2. Size it to the institute count — each shard is a ~90 MB Node process whether it
+owns a session or not, and sixteen of them for a handful of institutes was 1.5 GB doing nothing.
+
+**Browser lifecycle guards** (`src/sessionManager.js`, added after the 2026-09 runaway-CPU incident).
+Chrome cold start is the most expensive operation in this service, so three things stop a broken
+institute from triggering one on every job:
+
+- `assertSendable()` runs before anything touches Chrome. A session in `QR_REQUIRED`,
+  `PAIRING_CODE_REQUIRED`, `AUTH_FAILED` or `UNPAIRED` is waiting for a human and can never send, so
+  the job fails immediately with `unrecoverable: true` instead of relaunching a browser and timing
+  out 45s later, three times.
+- `assertRecreateAllowed()` / `noteRecreateOutcome()` give each institute a restart cooldown
+  (`WHATSAPP_RECREATE_COOLDOWN_MS`) and a circuit breaker that opens after
+  `WHATSAPP_RECREATE_FAILURE_LIMIT` consecutive failed restarts.
+- `recreateClient()` must **never** set `enabled: true`. It used to, which silently resurrected
+  institutes an operator had switched off.
+
+There is no cold-start branch in `sendText`/`sendFile` any more: an absent client reports
+`connected: false`, so `recreateClient()` handles "never started" and "went stale" through the one
+guarded path. Adding a second `start()` call there re-opens the hole.
+
+`restoreAll()` boots sessions **serially**, awaiting each `session.initPromise` and sleeping
+`WHATSAPP_RESTORE_STAGGER_MS` between them. `start()` does not await `client.initialize()` (the HTTP
+start endpoint must return immediately), so without this the loop launches every session at once —
+which is how 32 browsers, ~17.4 GB of demand, landed on an 8 GB box simultaneously.
+
+`npm run check` exercises all of the above without a browser or network. Run it after touching
+`sessionManager.js`.
 
 **Two transport paths over the same BullMQ queue** (`whatsapp-shard-<id>`), both in `src/shardRpc.js`:
 

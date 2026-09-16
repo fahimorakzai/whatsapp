@@ -14,6 +14,53 @@ const fsp = fs.promises;
 const QRCode = require('qrcode');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
+/*
+ * A session in one of these states is waiting for a human -- to scan a QR or
+ * type a pairing code. Retrying cannot move it forward, so a send must fail
+ * immediately rather than tear down and cold-start Chrome for nothing.
+ *
+ * This is the single most important guard in this file. Without it one unlinked
+ * institute relaunches a full browser on every queued message, forever: the
+ * 2026-09 incident was 2,138 queued jobs each destroying and rebooting Chrome,
+ * timing out after 45s, and retrying three times.
+ */
+const UNLINKED_STATUSES = new Set([
+  'QR_REQUIRED',
+  'PAIRING_CODE_REQUIRED',
+  'AUTH_FAILED',
+  'UNPAIRED'
+]);
+
+/*
+ * Chrome cold start is the most expensive thing this service does, so a failing
+ * institute gets a cooldown between browser restarts and a circuit breaker once
+ * restarts keep failing.
+ */
+const RECREATE_COOLDOWN_MS = Number(process.env.WHATSAPP_RECREATE_COOLDOWN_MS || 300000);
+const RECREATE_FAILURE_LIMIT = Number(process.env.WHATSAPP_RECREATE_FAILURE_LIMIT || 3);
+const CIRCUIT_OPEN_MS = Number(process.env.WHATSAPP_CIRCUIT_OPEN_MS || 900000);
+
+/*
+ * restoreAll() boots sessions one at a time. client.initialize() is deliberately
+ * not awaited by start() (the HTTP start endpoint must return immediately), so
+ * restore has to await the promise itself or every session launches at once --
+ * which is exactly what put 32 browsers, 17.4 GB of demand, onto an 8 GB box.
+ */
+const RESTORE_STAGGER_MS = Number(process.env.WHATSAPP_RESTORE_STAGGER_MS || 15000);
+const RESTORE_INIT_TIMEOUT_MS = Number(process.env.WHATSAPP_RESTORE_INIT_TIMEOUT_MS || 120000);
+
+/*
+ * `unrecoverable` is the flag shardWorkerProcess turns into BullMQ's
+ * UnrecoverableError, so the job is marked Failed once instead of burning its
+ * whole retry schedule on something that cannot succeed.
+ */
+function unsendableError(message) {
+  const error = new Error(message);
+  error.unrecoverable = true;
+  error.statusCode = 409;
+  return error;
+}
+
 class SessionManager {
   constructor(options = {}) {
     this.sessionPath = path.resolve(options.sessionPath);
@@ -21,6 +68,10 @@ class SessionManager {
     this.stateFile = path.join(this.statePath, 'sessions.json');
     this.clients = new Map();
     this.registry = new Map();
+    // Per-institute browser-restart guards, and a dedupe map so a wedged page
+    // does not write the same getState error to disk twice a second.
+    this.recreateGuards = new Map();
+    this.lastLogged = new Map();
 
     fs.mkdirSync(this.sessionPath, { recursive: true });
     fs.mkdirSync(this.statePath, { recursive: true });
@@ -30,6 +81,89 @@ class SessionManager {
   log(instituteId, message, extra = '') {
     const suffix = extra ? ` ${extra}` : '';
     console.log(`[wa][pid:${process.pid}][institute:${instituteId}] ${message}${suffix}`);
+  }
+
+  /*
+   * Log only when the message changes. waitUntilConnected polls twice a second
+   * for 45s, and a wedged page fails identically every time -- that is how one
+   * shard produced an 11 MB log file in a few hours.
+   */
+  logOnce(instituteId, key, message) {
+    const mapKey = `${instituteId}:${key}`;
+    if (this.lastLogged.get(mapKey) === message) return;
+    this.lastLogged.set(mapKey, message);
+    this.log(instituteId, key, message);
+  }
+
+  recreateGuard(instituteId) {
+    let guard = this.recreateGuards.get(instituteId);
+    if (!guard) {
+      guard = { lastAttemptAt: 0, failures: 0, openUntil: 0 };
+      this.recreateGuards.set(instituteId, guard);
+    }
+    return guard;
+  }
+
+  /*
+   * Fail fast when a send cannot possibly succeed: the institute is switched
+   * off, or its session is sitting on a QR/pairing screen waiting for a person.
+   * Called before anything touches Chrome.
+   */
+  assertSendable(instituteId) {
+    const registry = this.registry.get(instituteId);
+    if (registry && registry.enabled === false) {
+      throw unsendableError(`WhatsApp session for institute ${instituteId} is disabled`);
+    }
+
+    const status = this.clients.get(instituteId)?.status || registry?.lastStatus;
+    if (status && UNLINKED_STATUSES.has(status)) {
+      throw unsendableError(
+          `WhatsApp session for institute ${instituteId} is not linked (${status}) -- ` +
+          'scan the QR or request a pairing code'
+      );
+    }
+  }
+
+  assertRecreateAllowed(instituteId) {
+    const guard = this.recreateGuard(instituteId);
+    const now = Date.now();
+
+    if (guard.openUntil > now) {
+      throw unsendableError(
+          `WhatsApp session for institute ${instituteId} is in cooldown after repeated ` +
+          `browser restart failures (${Math.ceil((guard.openUntil - now) / 1000)}s remaining)`
+      );
+    }
+
+    if (guard.lastAttemptAt && now - guard.lastAttemptAt < RECREATE_COOLDOWN_MS) {
+      throw unsendableError(
+          `WhatsApp browser for institute ${instituteId} was restarted ` +
+          `${Math.round((now - guard.lastAttemptAt) / 1000)}s ago; not restarting again yet`
+      );
+    }
+
+    guard.lastAttemptAt = now;
+  }
+
+  noteRecreateOutcome(instituteId, succeeded) {
+    const guard = this.recreateGuard(instituteId);
+
+    if (succeeded) {
+      guard.failures = 0;
+      guard.openUntil = 0;
+      return;
+    }
+
+    guard.failures += 1;
+    if (guard.failures >= RECREATE_FAILURE_LIMIT) {
+      guard.openUntil = Date.now() + CIRCUIT_OPEN_MS;
+      guard.failures = 0;
+      this.log(
+          instituteId,
+          'CIRCUIT_OPEN',
+          `no further browser restarts for ${Math.round(CIRCUIT_OPEN_MS / 1000)}s`
+      );
+    }
   }
 
   normalizeInstituteId(instituteId) {
@@ -253,12 +387,21 @@ class SessionManager {
       this.log(instituteId, 'disconnected', error || '');
     });
 
-    client.initialize().catch((error) => {
-      setStatus('ERROR', error.message);
-      this.log(instituteId, 'initialization error', error.message);
-      try { client.destroy(); } catch (_) {}
-      this.clients.delete(instituteId);
-    });
+    /*
+     * Deliberately not awaited -- POST /api/sessions/:id/start must return
+     * immediately. The promise is kept on the session so restoreAll() can await
+     * it and boot sessions one at a time instead of all at once.
+     */
+    session.initPromise = client.initialize().then(
+        () => true,
+        (error) => {
+          setStatus('ERROR', error.message);
+          this.log(instituteId, 'initialization error', error.message);
+          try { client.destroy(); } catch (_) {}
+          this.clients.delete(instituteId);
+          return false;
+        }
+    );
 
     return this.getState(instituteId);
   }
@@ -274,9 +417,24 @@ class SessionManager {
         .map((row) => row.instituteId);
 
     console.log(`[wa][pid:${process.pid}] restoring ${ids.length} registered session(s)`);
-    for (const instituteId of ids) {
+    for (const [index, instituteId] of ids.entries()) {
       try {
         await this.start(instituteId, { restoring: true });
+
+        /*
+         * Wait for this browser to finish booting before starting the next one.
+         * start() returns as soon as the client object exists, so without this
+         * the loop launches every session simultaneously -- 11 Chrome processes
+         * and ~556 MB each, which is what exhausted the box.
+         */
+        const session = this.clients.get(instituteId);
+        if (session?.initPromise) {
+          await Promise.race([session.initPromise, this.sleep(RESTORE_INIT_TIMEOUT_MS)]);
+        }
+
+        if (RESTORE_STAGGER_MS > 0 && index < ids.length - 1) {
+          await this.sleep(RESTORE_STAGGER_MS);
+        }
       } catch (error) {
         this.updateRegistry(instituteId, { lastStatus: 'ERROR', lastError: error.message });
         console.error(`[wa][pid:${process.pid}][institute:${instituteId}] restore failed: ${error.message}`);
@@ -601,7 +759,7 @@ class SessionManager {
       }
     } catch (error) {
       if (!this.isRecoverableBrowserError(error)) {
-        this.log(instituteId, 'getState error', error?.message || String(error));
+        this.logOnce(instituteId, 'getState error', error?.message || String(error));
       }
     }
 
@@ -648,6 +806,11 @@ class SessionManager {
 
   async recreateClient(instituteId, reason = 'stale client') {
     instituteId = this.normalizeInstituteId(instituteId);
+
+    // Throws (unrecoverable) if this institute restarted recently or its
+    // circuit is open. Must run before anything touches the browser.
+    this.assertRecreateAllowed(instituteId);
+
     const existing = this.clients.get(instituteId);
 
     this.log(instituteId, 'STALE_CLIENT_RECOVERY start', reason);
@@ -662,17 +825,26 @@ class SessionManager {
 
     this.clients.delete(instituteId);
 
+    /*
+     * Note: no `enabled: true` here. Recovery must never re-enable an institute
+     * an operator switched off -- that silently resurrected a disabled session
+     * on the first queued job during the 2026-09 incident.
+     */
     this.updateRegistry(instituteId, {
-      enabled: true,
       lastStatus: 'RESTORING',
       lastError: null
     });
 
-    await this.start(instituteId, { restoring: true });
-    const session = await this.waitUntilConnected(instituteId, 45000);
-
-    this.log(instituteId, 'STALE_CLIENT_RECOVERY complete');
-    return session;
+    try {
+      await this.start(instituteId, { restoring: true });
+      const session = await this.waitUntilConnected(instituteId, 45000);
+      this.noteRecreateOutcome(instituteId, true);
+      this.log(instituteId, 'STALE_CLIENT_RECOVERY complete');
+      return session;
+    } catch (error) {
+      this.noteRecreateOutcome(instituteId, false);
+      throw error;
+    }
   }
 
   async getStateVerified(instituteId) {
@@ -740,12 +912,15 @@ class SessionManager {
     instituteId = this.normalizeInstituteId(instituteId);
     if (!String(message || '').trim()) throw new Error('Message is required');
 
-    let session = this.clients.get(instituteId);
-    if (!session) {
-      await this.start(instituteId, { restoring: true });
-      session = await this.waitUntilConnected(instituteId, 45000);
-    }
+    this.assertSendable(instituteId);
 
+    /*
+     * No separate cold-start branch. An absent client reports connected=false,
+     * so recreateClient() covers both "never started" and "went stale" through
+     * one guarded path -- a second start() here bypassed the cooldown entirely
+     * and relaunched Chrome on every queued job.
+     */
+    let session = this.clients.get(instituteId);
     let live = await this.getLiveClientState(instituteId);
     if (!live.connected) {
       session = await this.recreateClient(
@@ -791,12 +966,15 @@ class SessionManager {
     const resolvedPath = path.resolve(filePath);
     if (!fs.existsSync(resolvedPath)) throw new Error('Attachment file not found');
 
-    let session = this.clients.get(instituteId);
-    if (!session) {
-      await this.start(instituteId, { restoring: true });
-      session = await this.waitUntilConnected(instituteId, 45000);
-    }
+    this.assertSendable(instituteId);
 
+    /*
+     * No separate cold-start branch. An absent client reports connected=false,
+     * so recreateClient() covers both "never started" and "went stale" through
+     * one guarded path -- a second start() here bypassed the cooldown entirely
+     * and relaunched Chrome on every queued job.
+     */
+    let session = this.clients.get(instituteId);
     let live = await this.getLiveClientState(instituteId);
     if (!live.connected) {
       session = await this.recreateClient(

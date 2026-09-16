@@ -9,7 +9,8 @@
     "start:api": "node src/server.js api",
     "start:worker": "node src/server.js worker",
     "dev": "nodemon src/server.js api",
-    "dev:worker": "WHATSAPP_SHARD_ID=0 nodemon src/server.js worker"
+    "dev:worker": "WHATSAPP_SHARD_ID=0 nodemon src/server.js worker",
+    "check": "node scripts/check-guards.js"
   },
   "engines": {
     "node": ">=18"
