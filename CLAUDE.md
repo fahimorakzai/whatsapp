@@ -148,6 +148,43 @@ correct while exactly one process owns each shard. Running two processes with th
 `WHATSAPP_SHARD_ID` breaks both pacing and session ownership; move pacing into Redis before scaling
 past one worker per shard.
 
+**Sessions are on-demand, not resident.** A browser is ~556 MB and 11 processes (measured), so
+holding one open per linked institute capped the fleet at about ten on an 8 GB box — while a school
+actually sends in a burst once a month. Instead:
+
+- `restoreAll()` **registers and starts nothing.** The first message for an institute creates its
+  browser. Re-adding a `start()` there re-creates the boot storm.
+- `makeRoomFor()` enforces `WHATSAPP_MAX_LIVE_SESSIONS` (6). It is called from `start()` — the only
+  place a browser is created — and from the worker preflight via `ensureCapacityFor()`.
+- The eviction victim is the least-recently-used session idle longer than
+  `WHATSAPP_MIN_IDLE_BEFORE_EVICT_MS`. A session mid-send is never evicted.
+- `sweepIdleSessions()` closes anything untouched for `WHATSAPP_SESSION_IDLE_MS` (30 min) — long
+  enough that one school's paced run (80 min for 400 students at 5/min) stays a single session.
+- `closeSession()` keeps the registry row **enabled** and the LocalAuth directory intact. Only the
+  browser goes.
+
+**`IDLE` and `QR_REQUIRED` mean opposite things and the difference is load-bearing.** `IDLE` is a
+healthy session asleep — nobody needs to do anything. `QR_REQUIRED` means a human must re-link. The
+PearlIMS admin screen renders that distinction in plain language, and there is no keepalive (a
+deliberate choice), so it is the only signal an admin gets that a dormant institute has lapsed.
+`closeSession()` and `restoreAll()` both refuse to overwrite an `UNLINKED_STATUSES` value with
+`IDLE` for exactly this reason.
+
+**A full pool is not a failure.** When every live session is busy, `makeRoomFor()` throws
+`capacityError` (`error.capacity`, never `unrecoverable`), and `processTrackedSend`'s preflight
+turns it into `job.moveToDelayed()` + `DelayedError` — re-queued **without consuming a retry
+attempt**, with the row still `Queued` because `markProcessing` runs inside the pacing callback.
+Marking these `Failed` would drop legitimate sends whenever the service was merely working.
+
+**`getStateVerified()` must never start a session.** The admin screen polls it; opening a settings
+page must not cold-start Chrome. It reports from the registry.
+
+**Prefer one shard.** Institutes shard by `id % WHATSAPP_TOTAL_SHARDS`, so splitting a pool across
+two workers lets the parity of the ids decide the balance — six even-numbered schools would queue on
+one worker while the other sat idle. CPU is never the constraint (six live sessions are 11% of one
+core), so `WHATSAPP_TOTAL_SHARDS=1` with `WHATSAPP_MAX_LIVE_SESSIONS=6` is the right shape until
+something else forces a change.
+
 **Session state lives in three places** (`src/sessionManager.js`):
 
 1. `this.clients` — in-memory live Puppeteer/whatsapp-web.js clients, lost on restart.
