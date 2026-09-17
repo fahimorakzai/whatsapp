@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 sessions (`whatsapp-web.js` + Puppeteer) on behalf of many institutes, for Pearl IMS.
 
 ```
-Pearl IMS -> API process -> Redis/BullMQ -> shard worker 0..15 -> SessionManager -> WhatsApp Web
+Pearl IMS -> API process -> Redis/BullMQ -> shard worker(s) -> SessionManager -> WhatsApp Web
                   |                                                       |
                 MySQL (whatsapp_message audit trail)          LocalAuth session dirs on disk
 ```
@@ -24,9 +24,14 @@ npm run dev                 # nodemon, API role
 npm run start:api           # node src/server.js api
 WHATSAPP_SHARD_ID=0 npm run start:worker   # one process per shard; ID is mandatory and unique
 
-pm2 start ecosystem.config.js   # production: 1 API + 16 shard workers = 17 processes
+pm2 start ecosystem.config.js   # production: 1 API + WHATSAPP_TOTAL_SHARDS workers (currently 1 + 1)
 pm2 delete all && pm2 start ecosystem.config.js && pm2 save
 ```
+
+**Testing the whole loop (PearlIMS screen -> this service -> a real phone) is in
+`LOCAL_TESTING.md`.** It covers the parts that are not guessable: reaching a host-run service from
+the PearlIMS PHP container, the Chrome cache path, forging a `PI-AuthToken` to curl the endpoints,
+and why a PHP fatal shows up as an empty HTTP 500.
 
 Requires a running Redis and MySQL. For local work:
 
@@ -36,9 +41,9 @@ cp .env.dev.example .env
 npm run dev / npm run dev:worker
 ```
 
-`.env.dev.example` sets `WHATSAPP_TOTAL_SHARDS=1` so a single worker owns every institute. With the
-production value of `16` you must run the worker whose id equals `instituteId % 16` or jobs sit in
-the queue unclaimed — the commonest local dead end.
+`.env.dev.example` sets `WHATSAPP_TOTAL_SHARDS=1` so a single worker owns every institute. If you
+raise it, you must run the worker whose id equals `instituteId % TOTAL_SHARDS` or jobs sit in the
+queue unclaimed — the commonest local dead end.
 
 `sql/` holds the `whatsapp_message` DDL, reconstructed from `messageRepository.js` because the table
 was only ever created by hand on production. Treat it as good enough for local, not authoritative
@@ -118,13 +123,13 @@ file's basename — a parent should see `term-result-1043.pdf`, not `blob`.
 `fileStore.entryPath()` is the only place a path is built from caller input: the id must match a
 UUID pattern and must resolve directly under the store root. Keep both checks.
 
-The store is a **single-host** design. The API writes and all sixteen workers read the same
+The store is a **single-host** design. The API writes and every worker reads the same
 directory, so moving a worker to a second machine breaks file sends silently — the job resolves to a
 path that does not exist there. That is the point at which S3 (or any shared object store) becomes
 necessary; until then it would only add an AWS dependency and a bucket allowlist to maintain.
 
 Nothing deletes on send — one file may go to many parents — so `FILE_STORE_TTL_HOURS` (default 48)
-is what reclaims space. Only the API prunes; workers never do, so sixteen sweepers cannot race.
+is what reclaims space. Only the API prunes; workers never do, so parallel sweepers cannot race.
 
 **Worker command dispatch** is a single `switch (job.name)` in `createCommandProcessor`
 (`shardWorkerProcess.js`). Adding an endpoint means adding a case there *and* a route in
